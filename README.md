@@ -133,6 +133,42 @@ You'll then find in `models/` the `*.pt` files (PyTorch state_dict + config) and
 
 **Once DVC is set up (#13)**: `uv run dvc pull` will fetch the raw + processed data in one command, no Kaggle or W&B detour needed.
 
+### 4-bis. Reuse a downloaded model — without retraining
+
+Once the `.pt` checkpoint is in `models/`, three lines load it back into a ready-to-use `nn.Module`:
+
+```python
+import torch
+from mlops_project.models.factory import load_checkpoint
+from mlops_project.data.dataset import BrainMRIDataset, load_dataset_artifacts
+from mlops_project.data.transforms import eval_transform
+
+# 1. Rebuild model + load weights (architecture is read from the checkpoint)
+model, ckpt = load_checkpoint("models/resnet50_transfer.pt", device="cpu")
+print(f"loaded {ckpt['model_name']} — test AUC={ckpt['test_metrics']['auc_roc']:.3f}")
+
+# 2. Run a prediction on any prepared test slice
+index, stats = load_dataset_artifacts("data/processed")
+ds = BrainMRIDataset(index, stats, split="test", transform=eval_transform())
+sample = ds[0]
+
+with torch.no_grad():
+    logit = model(sample["image"].unsqueeze(0))
+    prob = torch.sigmoid(logit).item()
+
+print(f"P(tumour)={prob:.3f}, ground-truth={sample['label'].item()}")
+```
+
+`load_checkpoint()` reads the architecture name and its kwargs from the `.pt` file itself, so you don't need to remember whether the file holds a SimpleCNN or a ResNet50 — the call works the same.
+
+The returned `ckpt` dict also exposes:
+- `ckpt['best_val_auc']` — the val AUC at the saved epoch
+- `ckpt['test_metrics']` — `{accuracy, sensitivity, specificity, auc_roc, tp, fp, tn, fn}`
+- `ckpt['history']` — per-epoch metrics, useful to plot training curves locally
+- `ckpt['hydra_cfg']` — the full Hydra config used (model kwargs, lr, epochs, batch size, seed) so the run is fully reproducible
+
+To predict on **your own** image (not from the prepared test set), apply the same per-channel z-score normalisation the Dataset uses — the stats live in `data/processed/norm_stats.json`. Easiest pattern: instantiate `BrainMRIDataset` once and let it handle the preprocessing.
+
 ### 5. Verify everything works
 
 ```bash

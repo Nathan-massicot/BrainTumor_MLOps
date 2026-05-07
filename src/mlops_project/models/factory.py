@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
+import torch
 from torch import nn
 
 from mlops_project.models.baseline import StatsLogisticRegression
@@ -34,3 +37,36 @@ def count_parameters(model: nn.Module) -> tuple[int, int]:
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     return total, trainable
+
+
+def load_checkpoint(
+    path: str | Path,
+    *,
+    device: str | torch.device = "cpu",
+    eval_mode: bool = True,
+) -> tuple[nn.Module, dict]:
+    """Rebuild a model from a `.pt` saved by `training/train.py`.
+
+    The checkpoint stores the architecture name and its kwargs alongside the
+    state-dict, so the caller doesn't need to remember which `model=` was used.
+
+    Args:
+        path: path to a `.pt` file produced by `training/train.py`.
+        device: target device for the model and weights.
+        eval_mode: if True, the model is set to `.eval()` before being returned
+            (BN layers and dropout deactivated). Set to False if you need to
+            fine-tune.
+
+    Returns:
+        (model, ckpt) — the ready-to-use module, plus the full checkpoint dict
+        (state_dict, config, best_val_auc, test_metrics, history) for
+        downstream introspection.
+    """
+    ckpt = torch.load(path, map_location=device, weights_only=False)
+    name = ckpt["model_name"]
+    kwargs = ckpt.get("hydra_cfg", {}).get("model", {}).get("kwargs", {}) or {}
+    model = build_model(name, **kwargs).to(device)
+    model.load_state_dict(ckpt["state_dict"])
+    if eval_mode:
+        model.eval()
+    return model, ckpt
