@@ -240,3 +240,6 @@ Documents/
 *.bak
 *.tmp
 .cache/
+
+# Local helper scripts (not for VCS)
+.scripts/
