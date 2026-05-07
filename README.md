@@ -12,7 +12,9 @@ End-to-end MLOps pipeline for **brain tumor detection and localization** from MR
 - **Team**: Gabriel Gillmann · Helena Martínez Río · Nathan Massicot · Jahnavi Patil.
 - **Dataset**: [LGG MRI Segmentation](https://www.kaggle.com/datasets/mateuszbuda/lgg-mri-segmentation) (Kaggle).
 - **Task**: binary classification (tumor / no tumor) on MRI slices, with localization as a stretch goal.
-- **Model**: CNN with **transfer learning** (ResNet, EfficientNet, etc.).
+- **Model**: CNN with **transfer learning** (ResNet50, EfficientNet, etc.).
+
+📘 **Full technical documentation**: [`docs/PIPELINE.md`](docs/PIPELINE.md) — data pipeline, models, results, architecture choices.
 
 ---
 
@@ -24,177 +26,212 @@ End-to-end MLOps pipeline for **brain tumor detection and localization** from MR
 | ML framework | **PyTorch** + torchvision |
 | Experiment tracking | **Weights & Biases** |
 | Configs | **Hydra** / OmegaConf |
-| Data versioning | **DVC** |
+| Data & model versioning | **DVC** + **W&B Artifacts** |
 | API | **FastAPI** |
-| Frontend | **Streamlit** (or React, TBD) |
-| Containerization | **Docker** + docker-compose |
+| Frontend | **Streamlit** |
+| Containers | **Docker** + docker-compose |
 | CI/CD | **GitHub Actions** |
 | Monitoring | **Prometheus** + **Grafana** |
 | Drift detection | **Evidently AI** |
-| Orchestration / retraining | **Prefect** (or Airflow) |
+| Orchestration / retraining | **Prefect** |
 | Model Registry | **W&B Model Registry** |
-| Testing | **pytest** + httpx |
+| Tests | **pytest** + httpx |
 | Lint / format | **Ruff** |
 | Pre-commit | **pre-commit** + Conventional Commits |
-
----
-
-## Project Structure
-
-```
-brain-tumor-mlops/
-├── .github/workflows/        # CI/CD pipelines
-├── configs/                  # Hydra configs (model, training, data, ...)
-├── data/                     # DVC-tracked, never commit raw data
-│   ├── raw/
-│   └── processed/
-├── docker/                   # per-service Dockerfiles
-├── docs/                     # MkDocs documentation
-├── frontend/                 # Streamlit / React UI
-├── monitoring/               # Grafana dashboards, Prometheus config
-├── notebooks/                # exploration / EDA — not for production code
-├── pipelines/                # Prefect flows (training, retraining, drift)
-├── src/brain_tumor_mlops/
-│   ├── api/                  # FastAPI app, routes, schemas
-│   ├── data/                 # datasets, transforms, loaders
-│   ├── models/               # CNN architectures
-│   ├── training/             # train/val loops
-│   ├── inference/            # prediction logic
-│   ├── monitoring/           # drift, metrics
-│   └── utils/                # logging, helpers
-├── tests/                    # pytest (unit + integration)
-├── pyproject.toml
-├── docker-compose.yml
-├── dvc.yaml
-├── .pre-commit-config.yaml
-├── .env.example
-└── README.md
-```
-
-**Rule**: all production code lives in `src/brain_tumor_mlops/`. Notebooks are for exploration only — never import from a notebook.
 
 ---
 
 ## Prerequisites
 
 - **Python 3.12**
-- **[uv](https://docs.astral.sh/uv/)**: `curl -LsSf https://astral.sh/uv/install.sh | sh`
+- **[uv](https://docs.astral.sh/uv/)** — `curl -LsSf https://astral.sh/uv/install.sh | sh`
 - **Git**
-- **Docker** + **docker-compose**
-- A **Kaggle** account + a **Weights & Biases** account
-- **GPU** recommended (CUDA / MPS) for training, optional for inference
+- A free **Weights & Biases** account — https://wandb.ai
+- A **Kaggle** account (only to download the raw dataset if you skip DVC)
+- **Docker** (optional, for the full local stack)
+- **GPU** recommended for training (CUDA / MPS); inference runs on CPU
 
 ---
 
-## Setup (first time)
+## Setup for a new teammate — 5 steps
 
-### 1. Clone the repo
+> Goal: from "I just cloned the repo" to "I can run a training and see live charts on W&B" in under 10 minutes.
 
-```bash
-git clone <repo-url>
-cd brain-tumor-mlops
-```
-
-### 2. Install dependencies
+### 1. Clone and install
 
 ```bash
+git clone https://github.com/Nathan-massicot/BrainTumor_MLOps.git
+cd BrainTumor_MLOps
 uv sync
 ```
 
-`uv` creates `.venv/` and installs everything (deps + dev) from `pyproject.toml` / `uv.lock`.
+`uv sync` creates `.venv/` and installs **all** dependencies (prod + dev) from `pyproject.toml` / `uv.lock`. No need to `pip install` anything else.
 
-### 3. Configure environment variables
+### 2. Configure your `.env` (secrets and infra only)
 
 ```bash
 cp .env.example .env
 ```
 
-Open `.env` and fill in:
+Edit `.env` and fill in:
 
-- `WANDB_API_KEY` — get yours at https://wandb.ai/authorize
+| Variable | What to put | Where to get it |
+|---|---|---|
+| `WANDB_API_KEY` | your personal W&B key | https://wandb.ai/authorize (login → Settings → API key) |
+| `WANDB_PROJECT` | `brain-tumor-classification` | already in `.env.example` |
+| `WANDB_ENTITY` | `nathan2massicot-berner-fachhochschule` | see §3 below |
+| `KAGGLE_USERNAME` + `KAGGLE_KEY` | your Kaggle creds | https://www.kaggle.com/settings → Create New API Token |
 
+> **Important**: `.env` is **gitignored** — never commit it. All hyperparameters (learning rate, batch size, epochs, model choice) are **NOT in `.env`** — they live in `configs/` (Hydra). To change them, edit a YAML or pass `key=value` on the CLI to `train.py`.
 
-### 4. Enable pre-commit hooks
+### 3. Get access to Weights & Biases
 
+The project currently sits on Nathan's personal entity (`nathan2massicot-berner-fachhochschule`). Two paths for teammates:
+
+**Option A — Get invited to the existing entity** (fast)
+1. Create a W&B account with your institutional email.
+2. Send your username to Nathan, who will invite you via Project Settings → Members.
+3. Once invited, set in your `.env`:
+   ```
+   WANDB_ENTITY=nathan2massicot-berner-fachhochschule
+   WANDB_PROJECT=brain-tumor-classification
+   ```
+
+**Option B — Migrate to an academic Team** (target state)
+W&B offers a free academic plan for student teams (https://wandb.ai/site/research). Once the Team is created, we'll update `WANDB_ENTITY` in `.env.example` so everyone switches to it.
+
+To verify your W&B connection works:
 ```bash
-pre-commit install
-pre-commit install --hook-type commit-msg
+uv run python -c "import os; from dotenv import load_dotenv; load_dotenv(); import wandb; list(wandb.Api().runs(f'{os.environ[\"WANDB_ENTITY\"]}/{os.environ[\"WANDB_PROJECT\"]}')); print('OK')"
 ```
 
-### 5. Pull data via DVC
+### 4. Get the data and the trained model weights
+
+Three sources, pick depending on what you need:
+
+| What | Where | How |
+|---|---|---|
+| **Raw dataset** (original TIFFs) | Kaggle | `uv run kaggle datasets download -d mateuszbuda/lgg-mri-segmentation -p data/raw --unzip` (needs Kaggle creds in `.env`) |
+| **Prepared dataset** (parquet + stats) | W&B Artifact `lgg-mri-prepared:latest` | `uv run wandb artifact get nathan2massicot-berner-fachhochschule/brain-tumor-classification/lgg-mri-prepared:latest --root data/processed` |
+| **Trained model weights** | W&B Artifacts `model-{name}` | see below |
+
+**Pull model weights from W&B** (the `.pt` files are NOT in Git — too large, already versioned via W&B Artifacts):
 
 ```bash
-uv run dvc pull
+# One specific model
+uv run wandb artifact get nathan2massicot-berner-fachhochschule/brain-tumor-classification/model-resnet50_transfer:v0 --root models
+
+# All four
+for m in baseline simple_cnn unet_classifier resnet50_transfer; do
+  uv run wandb artifact get "nathan2massicot-berner-fachhochschule/brain-tumor-classification/model-${m}:v0" --root models
+done
 ```
 
-If this is the **first init** (maintainer only):
+You'll then find in `models/` the `*.pt` files (PyTorch state_dict + config) and `*_results.json` (text summaries).
+
+> Alternative: if you have a GPU/MPS handy and don't mind waiting, you can also retrain everything in 5 epochs (~30 min) with `uv run python -m mlops_project.training.train --multirun model=baseline,simple_cnn,unet_classifier,resnet50_transfer`.
+
+**Once DVC is set up (#13)**: `uv run dvc pull` will fetch the raw + processed data in one command, no Kaggle or W&B detour needed.
+
+### 5. Verify everything works
 
 ```bash
-uv run dvc init
-uv run dvc remote add -d storage <remote-url>   # e.g. gdrive://..., s3://..., etc.
+uv run pytest tests/ -v        # 20 tests, must be 100% green
 ```
 
+Green → you're ready to train.
 
 ---
 
-## Common Commands
+## Daily workflow
 
-### Development
+### Run a training
+
+```bash
+# Default model (simple_cnn, 5 epochs, batch 32)
+uv run python -m mlops_project.training.train
+
+# Pick one of the 4 architectures
+uv run python -m mlops_project.training.train model=resnet50_transfer
+uv run python -m mlops_project.training.train model=unet_classifier
+
+# Override hyperparameters from the CLI (Hydra syntax)
+uv run python -m mlops_project.training.train model=resnet50_transfer training.epochs=20 training.lr=1e-4 data.batch_size=64
+
+# Train all 4 models in a row (multirun)
+uv run python -m mlops_project.training.train --multirun \
+    model=baseline,simple_cnn,unet_classifier,resnet50_transfer training.epochs=10
+```
+
+Every run:
+- logs per-epoch metrics to W&B (loss, sensitivity, specificity, AUC, confusion matrix)
+- keeps the best checkpoint (by val AUC) and saves it to `models/{name}.pt`
+- uploads that checkpoint as a W&B Artifact `model-{name}:vN`
+- evaluates the best checkpoint on the test set and reports final metrics
+
+### Disable W&B for a single run
+
+```bash
+uv run python -m mlops_project.training.train model=simple_cnn no_wandb=true
+```
+
+### Tests, lint, format
 
 ```bash
 uv run pytest                                # all tests
-uv run pytest tests/test_models.py -v        # one test file
+uv run pytest tests/test_splits.py -v        # one specific file
 uv run ruff check .                          # lint
 uv run ruff format .                         # format
-pre-commit run --all-files                   # run all hooks manually
 ```
 
-### Training
+### Regenerate the dataset (after a raw-data change)
 
 ```bash
-# default config
-uv run python -m brain_tumor_mlops.training.train
-
-# Hydra overrides
-uv run python -m brain_tumor_mlops.training.train model=resnet50 training.lr=1e-4
-
-# hyperparameter sweep (W&B)
-uv run wandb sweep configs/sweeps/lr_sweep.yaml
+uv run python -m mlops_project.data.prepare
 ```
 
-### API & Frontend
-
-```bash
-# FastAPI (dev mode)
-uv run uvicorn brain_tumor_mlops.api.main:app --reload
-# -> http://localhost:8000/docs
-
-# Streamlit frontend
-uv run streamlit run frontend/app.py
-# -> http://localhost:8501
-
-# Full stack
-docker-compose up
-```
-
-### Data & Models
-
-```bash
-dvc add data/raw/lgg-mri              # version a new dataset
-dvc push                              # push to remote storage
-dvc repro                             # rerun pipeline if inputs changed
-```
-
-### Monitoring
-
-```bash
-docker-compose up prometheus grafana                          # monitoring stack
-uv run python -m brain_tumor_mlops.monitoring.drift_check     # manual drift report
-```
+Rebuilds `data/processed/slice_index.parquet` + `norm_stats.json` and uploads a new version of the `lgg-mri-prepared` artifact.
 
 ---
 
-## Git Workflow
+## Project structure
+
+```
+BrainTumor_MLOps/
+├── .github/workflows/        # CI/CD
+├── configs/                  # Hydra (model, training, data)
+│   ├── config.yaml
+│   ├── data/default.yaml
+│   ├── training/default.yaml
+│   └── model/{baseline,simple_cnn,unet_classifier,resnet50_transfer}.yaml
+├── data/                     # gitignored, managed by DVC
+│   ├── raw/                  # original TIFFs
+│   └── processed/            # slice_index.parquet, norm_stats.json
+├── docs/
+│   └── PIPELINE.md           # full technical documentation
+├── models/                   # gitignored, *.pt pulled from W&B Artifacts
+├── notebooks/
+│   └── 01_eda.ipynb          # exploratory data analysis (20 visualisations)
+├── src/mlops_project/
+│   ├── data/                 # splits, Dataset, transforms, prep
+│   ├── models/               # 4 architectures + factory
+│   ├── training/             # train loop, metrics
+│   ├── api/                  # FastAPI (Phase 3, upcoming)
+│   ├── inference/            # prediction logic (Phase 3)
+│   ├── monitoring/           # drift, metrics (Phase 5)
+│   └── utils/                # wandb logging, helpers
+├── tests/                    # pytest (20 tests)
+├── pyproject.toml
+├── dvc.yaml
+├── .env.example
+└── README.md
+```
+
+**Rule**: all production code lives in `src/mlops_project/`. Notebooks are for exploration only — never import from a notebook into production code.
+
+---
+
+## Git workflow
 
 ### Branches
 
@@ -204,21 +241,46 @@ uv run python -m brain_tumor_mlops.monitoring.drift_check     # manual drift rep
 - `fix/<short-description>` — bug fixes.
 - `docs/<short-description>` — documentation only.
 
-
 ### Pull Requests
 
-- Open PR against `dev`.
-- Require ≥ 1 review from another team member.
+- PR against `dev`.
+- ≥ 1 review from another team member.
 - All CI checks must pass.
 - **Squash merge** to keep history clean.
-- Tasks are tracked via the **GitHub Project** linked to the repo.
+- Tasks tracked on the **GitHub Project** linked to the repo.
+
+### Conventional Commits
+
+Format: `type(scope): description`. Examples:
+
+```
+feat(models): add ResNet50 transfer learning architecture
+fix(api): handle empty image upload with 422 response
+docs: add monitoring setup to README
+test(data): add tests for patient-level train/val split
+chore(deps): bump pytorch to 2.4.0
+```
 
 ---
 
-
-## Useful Links
+## Useful links
 
 - **Dataset**: https://www.kaggle.com/datasets/mateuszbuda/lgg-mri-segmentation
-- **W&B project**: _to be added_
-- **Deployed app**: _to be added_
-- **Internal docs**: _to be added_
+- **W&B project**: https://wandb.ai/nathan2massicot-berner-fachhochschule/brain-tumor-classification
+- **GitHub Project (task board)**: https://github.com/users/Nathan-massicot/projects/2
+- **Technical documentation**: [`docs/PIPELINE.md`](docs/PIPELINE.md)
+
+---
+
+## Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| `WANDB_API_KEY not set` | You haven't configured `.env`. Redo step 2. |
+| `Could not find project brain-tumor-classification` | `WANDB_ENTITY` is missing or wrong in `.env`. Set it to `nathan2massicot-berner-fachhochschule`. |
+| `mlops_project` imports fail | You haven't run `uv sync`. The package is installed in editable mode from `pyproject.toml`. |
+| First epoch endless on Mac (Apple Silicon) | Normal: MPS compiles its Metal kernel cache on the first batch (15–25 min). Subsequent epochs: ~25 s. **Don't ctrl-C.** |
+| Data tests fail with `slice_index.parquet missing` | Run `uv run python -m mlops_project.data.prepare` once. |
+| `models/{name}.pt missing` | Either retrain (see "Run a training") or pull from W&B (see step 4). |
+
+For anything else, ping the team on Discord/Slack, or open a GitHub issue.
