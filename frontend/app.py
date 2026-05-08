@@ -44,17 +44,7 @@ def run_mock_predictor(
     tumor_bias: float,
     seed: int,
 ) -> MockPrediction:
-    """Generate a fake model output for UI and integration testing.
-
-    Args:
-        image_bytes: Raw uploaded file bytes.
-        threshold: Decision boundary between no-tumor and tumor.
-        tumor_bias: Positive values increase tumor probability.
-        seed: Manual seed for reproducibility demos.
-
-    Returns:
-        MockPrediction: Predicted class and confidence-like score.
-    """
+    """Generate a fake model output for UI and integration testing."""
     base_score = _stable_random_value(image_bytes=image_bytes, seed=seed)
     shifted_score = min(1.0, max(0.0, base_score + tumor_bias))
 
@@ -114,16 +104,7 @@ def to_grayscale(image: Image.Image) -> Image.Image:
 def generate_mock_attention(
     image: Image.Image, prediction: MockPrediction, seed: int = 42
 ) -> np.ndarray:
-    """Generate a mock attention heatmap showing where the model 'focuses'.
-    
-    Args:
-        image: The input MRI image.
-        prediction: The model prediction result.
-        seed: Seed for reproducible heatmap generation.
-    
-    Returns:
-        A numpy array (H, W) with values in [0, 1] representing attention intensity.
-    """
+    """Generate a mock attention heatmap showing where the model 'focuses'."""
     rng = random.Random(seed + int(prediction.risk_score * 1000))
     width, height = image.size
 
@@ -140,6 +121,35 @@ def generate_mock_attention(
     heatmap = heatmap * prediction.confidence
 
     return heatmap
+
+
+def apply_heatmap_overlay(image: Image.Image, heatmap: np.ndarray) -> np.ndarray:
+    """Blend a jet-colormap heatmap over the original image for better readability.
+
+    Returns an RGB uint8 array.
+    """
+    # Convert image to RGB numpy array
+    img_rgb = np.array(image.convert("RGB")).astype(float) / 255.0
+    h, w = img_rgb.shape[:2]
+
+    # Resize heatmap to match image if needed
+    if heatmap.shape != (h, w):
+        heatmap_img = Image.fromarray((heatmap * 255).astype(np.uint8)).resize((w, h), Image.BILINEAR)
+        heatmap = np.array(heatmap_img).astype(float) / 255.0
+
+    # Apply jet colormap manually (blue → cyan → green → yellow → red)
+    def jet_colormap(t: np.ndarray) -> np.ndarray:
+        r = np.clip(1.5 - np.abs(t - 0.75) * 4, 0, 1)
+        g = np.clip(1.5 - np.abs(t - 0.50) * 4, 0, 1)
+        b = np.clip(1.5 - np.abs(t - 0.25) * 4, 0, 1)
+        return np.stack([r, g, b], axis=-1)
+
+    colored = jet_colormap(heatmap)  # (H, W, 3)
+
+    # Blend: strong heatmap areas dominate, weak areas show original
+    alpha = heatmap[..., np.newaxis] * 0.65
+    blended = img_rgb * (1 - alpha) + colored * alpha
+    return (np.clip(blended, 0, 1) * 255).astype(np.uint8)
 
 
 def main() -> None:
@@ -227,7 +237,8 @@ def main() -> None:
                     preview_image = to_grayscale(load_image(selected_example))
                     possible_mask = mask_path_for(selected_example)
                     if possible_mask.exists():
-                        mask_image = to_grayscale(load_image(possible_mask))
+                        # Load mask as RGB so white regions are actually visible
+                        mask_image = load_image(possible_mask).convert("RGB")
 
         if file_bytes is None:
             return
@@ -240,7 +251,7 @@ def main() -> None:
             st.image(preview_image, caption="Input preview (grayscale)", use_container_width=True)
 
         if mask_image is not None:
-            st.image(mask_image, caption="Reference mask from raw data (grayscale)", use_container_width=True)
+            st.image(mask_image, caption="Reference mask from raw data", use_container_width=True)
 
         predict_clicked = input_mode == "Upload" and st.button("Run mock prediction", type="primary")
 
@@ -260,7 +271,6 @@ def main() -> None:
             st.metric("Confidence", f"{result.confidence * 100:.1f}%")
             st.progress(result.risk_score, text=f"Risk score: {result.risk_score:.2f}")
 
-            # Neutral black and white result display
             if result.label == "tumor":
                 st.warning(f"⚠️ Model output: **TUMOR DETECTED** (confidence: {result.confidence*100:.1f}%)")
             else:
@@ -269,31 +279,25 @@ def main() -> None:
             if input_mode == "Examples" and selected_example is not None:
                 st.caption(f"Auto-run from raw example: {selected_example.relative_to(DATA_ROOT.parent)}")
 
-            # Add attention visualization
+            # Attention visualization with improved jet colormap overlay
             with st.expander("📍 Model Focus Map (Attention Visualization)"):
                 st.markdown(
                     f"This visualization shows where the model focuses to make its prediction. "
-                    f"**Confidence: {result.confidence*100:.1f}%**"
+                    f"**Confidence: {result.confidence*100:.1f}%** — warmer colors (red/yellow) indicate higher attention."
                 )
 
                 if preview_image is not None:
-                    attention = generate_mock_attention(
-                        preview_image, result, seed=int(seed)
-                    )
-
-                    img_array = np.array(preview_image).astype(float) / 255.0
-                    attention_normalized = attention / (attention.max() + 1e-6)
-                    overlay = img_array * (1 - attention_normalized * 0.4) + attention_normalized * 0.6
-                    overlay = (overlay * 255).astype(np.uint8)
+                    attention = generate_mock_attention(preview_image, result, seed=int(seed))
+                    overlay = apply_heatmap_overlay(preview_image, attention)
 
                     col1, col2 = st.columns(2)
                     with col1:
-                        st.image(preview_image, caption="Original Image (B&W)", use_container_width=True)
+                        st.image(preview_image, caption="Original Image (grayscale)", use_container_width=True)
                     with col2:
-                        st.image(overlay, caption="Model Focus Map", use_container_width=True)
-                    
+                        st.image(overlay, caption="Focus Map (red = high attention)", use_container_width=True)
+
                     st.markdown(
-                        f"The focus map highlights the regions contributing to the **{result.label.upper()}** prediction "
+                        f"The focus map highlights regions contributing to the **{result.label.upper()}** prediction "
                         f"with {result.confidence*100:.1f}% confidence."
                     )
 
@@ -302,7 +306,7 @@ def main() -> None:
                     "- We hashed the uploaded bytes for deterministic scoring.\n"
                     "- We applied a user-controlled bias to simulate model behavior.\n"
                     "- We compared score vs threshold to choose a class.\n"
-                    "- We generated a mock attention map to visualize model focus.\n"
+                    "- We generated a mock attention map using a jet colormap overlay.\n"
                     "- This is a mock pipeline to unblock UI development."
                 )
 
@@ -327,4 +331,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-# 
