@@ -73,9 +73,7 @@ uv sync
 cp .env.example .env
 ```
 
-Edit `.env` and fill it 
-
-```
+Edit `.env` and fill in the required values — most importantly `WANDB_API_KEY` and `WANDB_ENTITY=nathan2massicot-berner-fachhochschule` (only needed if you run trainings or pull from W&B; you can skip this if you only plan to **load** the existing checkpoints — see step 4).
 
 ### 3. Get the data and the trained model weights
 
@@ -93,15 +91,14 @@ The model weights come automatically with `git clone` (via Git LFS). The process
 
 > If you don't want any download at all and have a GPU/MPS handy: retrain everything in ~30 min with `uv run python -m mlops_project.training.train --multirun model=baseline,simple_cnn,unet_classifier,resnet50_transfer`.
 
-**Pull all four model weights from W&B in one go** (only if you went the W&B route):
+**Sanity check** — after `git clone`, confirm the LFS files came through:
 
 ```bash
-for m in baseline simple_cnn unet_classifier resnet50_transfer; do
-  uv run wandb artifact get "nathan2massicot-berner-fachhochschule/brain-tumor-classification/model-${m}:v0" --root models
-done
+ls -lh models/*.pt
+# Expected: ~5 KB, ~4.5 MB, ~18 MB, ~90 MB. If everything shows ~130 B, you cloned without LFS — run `git lfs pull`.
 ```
 
-The `.pt` files are stored via **Git LFS**, not as raw Git blobs — so the repo itself stays light, but a regular `git clone` still ends up with the files in `models/`.
+The `.pt` files are stored via **Git LFS**, not as raw Git blobs, so the repo itself stays light while `git clone` still ends up with the files in `models/`.
 
 ### 4. Reuse a model locally — no W&B, no retraining
 
