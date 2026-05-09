@@ -122,11 +122,10 @@ data/external/*
 !data/processed/.gitkeep
 
 # =============================================================================
-# Model artifacts — versioned via W&B Model Registry / DVC
+# Model artifacts — checkpoints in models/ are tracked via Git LFS (.pt files
+# and per-model results JSONs). Other ML formats remain ignored unless
+# explicitly tracked.
 # =============================================================================
-models/*
-!models/.gitkeep
-*.pt
 *.pth
 *.ckpt
 *.h5

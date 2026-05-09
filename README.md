@@ -30,14 +30,12 @@ End-to-end MLOps pipeline for **brain tumor detection and localization** from MR
 | API | **FastAPI** |
 | Frontend | **Streamlit** |
 | Containers | **Docker** + docker-compose |
-| CI/CD | **GitHub Actions** |
 | Monitoring | **Prometheus** + **Grafana** |
 | Drift detection | **Evidently AI** |
 | Orchestration / retraining | **Prefect** |
 | Model Registry | **W&B Model Registry** |
 | Tests | **pytest** + httpx |
-| Lint / format | **Ruff** |
-| Pre-commit | **pre-commit** + Conventional Commits |
+
 
 ---
 
@@ -45,7 +43,7 @@ End-to-end MLOps pipeline for **brain tumor detection and localization** from MR
 
 - **Python 3.12**
 - **[uv](https://docs.astral.sh/uv/)** — `curl -LsSf https://astral.sh/uv/install.sh | sh`
-- **Git**
+- **Git** + **Git LFS** — `brew install git-lfs && git lfs install` (macOS) — required to fetch the model checkpoints in `models/*.pt`
 - A free **Weights & Biases** account — https://wandb.ai
 - A **Kaggle** account (only to download the raw dataset if you skip DVC)
 - **Docker** (optional, for the full local stack)
@@ -67,75 +65,47 @@ uv sync
 
 `uv sync` creates `.venv/` and installs **all** dependencies (prod + dev) from `pyproject.toml` / `uv.lock`. No need to `pip install` anything else.
 
+> The four trained checkpoints (`models/*.pt`, ~115 MB total) are tracked via **Git LFS**, so `git clone` automatically pulls them as long as you ran `git lfs install` once on your machine. If you cloned before installing LFS, run `git lfs pull` from inside the repo.
+
 ### 2. Configure your `.env` (secrets and infra only)
 
 ```bash
 cp .env.example .env
 ```
 
-Edit `.env` and fill in:
+Edit `.env` and fill it 
 
-| Variable | What to put | Where to get it |
-|---|---|---|
-| `WANDB_API_KEY` | your personal W&B key | https://wandb.ai/authorize (login → Settings → API key) |
-| `WANDB_PROJECT` | `brain-tumor-classification` | already in `.env.example` |
-| `WANDB_ENTITY` | `nathan2massicot-berner-fachhochschule` | see §3 below |
-| `KAGGLE_USERNAME` + `KAGGLE_KEY` | your Kaggle creds | https://www.kaggle.com/settings → Create New API Token |
-
-> **Important**: `.env` is **gitignored** — never commit it. All hyperparameters (learning rate, batch size, epochs, model choice) are **NOT in `.env`** — they live in `configs/` (Hydra). To change them, edit a YAML or pass `key=value` on the CLI to `train.py`.
-
-### 3. Get access to Weights & Biases
-
-The project currently sits on Nathan's personal entity (`nathan2massicot-berner-fachhochschule`). Two paths for teammates:
-
-**Option A — Get invited to the existing entity** (fast)
-1. Create a W&B account with your institutional email.
-2. Send your username to Nathan, who will invite you via Project Settings → Members.
-3. Once invited, set in your `.env`:
-   ```
-   WANDB_ENTITY=nathan2massicot-berner-fachhochschule
-   WANDB_PROJECT=brain-tumor-classification
-   ```
-
-**Option B — Migrate to an academic Team** (target state)
-W&B offers a free academic plan for student teams (https://wandb.ai/site/research). Once the Team is created, we'll update `WANDB_ENTITY` in `.env.example` so everyone switches to it.
-
-To verify your W&B connection works:
-```bash
-uv run python -c "import os; from dotenv import load_dotenv; load_dotenv(); import wandb; list(wandb.Api().runs(f'{os.environ[\"WANDB_ENTITY\"]}/{os.environ[\"WANDB_PROJECT\"]}')); print('OK')"
 ```
 
-### 4. Get the data and the trained model weights
+### 3. Get the data and the trained model weights
 
-Three sources, pick depending on what you need:
+You need two artefact sets in your local checkout:
+- `data/processed/` — `slice_index.parquet` + `norm_stats.json` (used by `BrainMRIDataset`)
+- `models/` — `*.pt` checkpoints (each one bundles the state_dict, the architecture name, and the full Hydra config)
 
-| What | Where | How |
+The model weights come automatically with `git clone` (via Git LFS). The processed dataset is not in Git — pick whichever channel is easiest. **Loading a model afterwards does not require W&B** — see step 4.
+
+| What | Simplest option | MLOps option |
 |---|---|---|
-| **Raw dataset** (original TIFFs) | Kaggle | `uv run kaggle datasets download -d mateuszbuda/lgg-mri-segmentation -p data/raw --unzip` (needs Kaggle creds in `.env`) |
-| **Prepared dataset** (parquet + stats) | W&B Artifact `lgg-mri-prepared:latest` | `uv run wandb artifact get nathan2massicot-berner-fachhochschule/brain-tumor-classification/lgg-mri-prepared:latest --root data/processed` |
-| **Trained model weights** | W&B Artifacts `model-{name}` | see below |
+| **Raw dataset** (original TIFFs, ~140 MB) | `uv run kaggle datasets download -d mateuszbuda/lgg-mri-segmentation -p data/raw --unzip` (needs Kaggle creds in `.env`) | `dvc pull` once #13 lands |
+| **Prepared dataset** (`data/processed/`) | Ask a teammate to share `data/processed/` (~5 MB, zips well) — drop it in place | `uv run wandb artifact get nathan2massicot-berner-fachhochschule/brain-tumor-classification/lgg-mri-prepared:latest --root data/processed` |
+| **Trained model weights** (`models/*.pt`, ~115 MB total) | Already pulled by `git clone` thanks to **Git LFS** — nothing to do. Run `git lfs pull` if you cloned without LFS installed. | `uv run wandb artifact get nathan2massicot-berner-fachhochschule/brain-tumor-classification/model-{name}:v0 --root models` |
 
-**Pull model weights from W&B** (the `.pt` files are NOT in Git — too large, already versioned via W&B Artifacts):
+> If you don't want any download at all and have a GPU/MPS handy: retrain everything in ~30 min with `uv run python -m mlops_project.training.train --multirun model=baseline,simple_cnn,unet_classifier,resnet50_transfer`.
+
+**Pull all four model weights from W&B in one go** (only if you went the W&B route):
 
 ```bash
-# One specific model
-uv run wandb artifact get nathan2massicot-berner-fachhochschule/brain-tumor-classification/model-resnet50_transfer:v0 --root models
-
-# All four
 for m in baseline simple_cnn unet_classifier resnet50_transfer; do
   uv run wandb artifact get "nathan2massicot-berner-fachhochschule/brain-tumor-classification/model-${m}:v0" --root models
 done
 ```
 
-You'll then find in `models/` the `*.pt` files (PyTorch state_dict + config) and `*_results.json` (text summaries).
+The `.pt` files are stored via **Git LFS**, not as raw Git blobs — so the repo itself stays light, but a regular `git clone` still ends up with the files in `models/`.
 
-> Alternative: if you have a GPU/MPS handy and don't mind waiting, you can also retrain everything in 5 epochs (~30 min) with `uv run python -m mlops_project.training.train --multirun model=baseline,simple_cnn,unet_classifier,resnet50_transfer`.
+### 4. Reuse a model locally — no W&B, no retraining
 
-**Once DVC is set up (#13)**: `uv run dvc pull` will fetch the raw + processed data in one command, no Kaggle or W&B detour needed.
-
-### 4-bis. Reuse a downloaded model — without retraining
-
-Once the `.pt` checkpoint is in `models/`, three lines load it back into a ready-to-use `nn.Module`:
+Once a `.pt` checkpoint is in `models/`, three lines load it back into a ready-to-use `nn.Module`. **No W&B login or network call is involved** — `load_checkpoint()` is a pure local-file reader:
 
 ```python
 import torch
@@ -317,6 +287,6 @@ chore(deps): bump pytorch to 2.4.0
 | `mlops_project` imports fail | You haven't run `uv sync`. The package is installed in editable mode from `pyproject.toml`. |
 | First epoch endless on Mac (Apple Silicon) | Normal: MPS compiles its Metal kernel cache on the first batch (15–25 min). Subsequent epochs: ~25 s. **Don't ctrl-C.** |
 | Data tests fail with `slice_index.parquet missing` | Run `uv run python -m mlops_project.data.prepare` once. |
-| `models/{name}.pt missing` | Either retrain (see "Run a training") or pull from W&B (see step 4). |
+| `models/{name}.pt missing` or shows up as a tiny text file (~130 bytes) | You cloned without Git LFS installed. Run `brew install git-lfs && git lfs install && git lfs pull` from inside the repo. |
 
 For anything else, ping the team on Discord/Slack, or open a GitHub issue.
