@@ -1,5 +1,6 @@
 """Core inference logic for FastAPI."""
 
+import hashlib
 import io
 import json
 import logging
@@ -12,6 +13,7 @@ import torch
 from PIL import Image
 
 from mlops_project.models.factory import load_checkpoint
+from .metrics import metrics
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +23,55 @@ DATA_ROOT = PROJECT_ROOT / "data"
 PROCESSED_STATS_PATH = DATA_ROOT / "processed" / "norm_stats.json"
 
 IMAGE_SIZE = 256
+MAX_IMAGE_SIZE_MB = 10
+ALLOWED_FORMATS = {"PNG", "JPEG", "JPG", "TIF", "TIFF"}
+
+
+def validate_image_bytes(image_bytes: bytes) -> tuple[str, int]:
+    """
+    Validate image bytes.
+    
+    Args:
+        image_bytes: Raw image bytes
+    
+    Returns:
+        Tuple of (format, width*height) if valid
+    
+    Raises:
+        ValueError: If image is invalid
+    """
+    # Check size
+    size_mb = len(image_bytes) / (1024 * 1024)
+    if size_mb > MAX_IMAGE_SIZE_MB:
+        raise ValueError(f"Image too large: {size_mb:.1f}MB (max {MAX_IMAGE_SIZE_MB}MB)")
+    
+    if len(image_bytes) == 0:
+        raise ValueError("Empty image data")
+    
+    # Try to open as image
+    try:
+        image = Image.open(io.BytesIO(image_bytes))
+    except Exception as e:
+        raise ValueError(f"Invalid image format: {e}")
+    
+    # Check format
+    image_format = image.format.upper() if image.format else "UNKNOWN"
+    if image_format not in ALLOWED_FORMATS:
+        raise ValueError(f"Unsupported format: {image_format}. Allowed: {ALLOWED_FORMATS}")
+    
+    # Check dimensions (too small or too large)
+    width, height = image.size
+    if width < 64 or height < 64:
+        raise ValueError(f"Image too small: {width}x{height} (min 64x64)")
+    if width > 2048 or height > 2048:
+        raise ValueError(f"Image too large: {width}x{height} (max 2048x2048)")
+    
+    return image_format, width * height
+
+
+def hash_image(image_bytes: bytes) -> str:
+    """Compute SHA256 hash of image bytes."""
+    return hashlib.sha256(image_bytes).hexdigest()[:16]
 
 
 def get_normalization_stats() -> tuple[np.ndarray, np.ndarray]:
@@ -96,6 +147,7 @@ def preprocess_image(image_data: bytes, mean: np.ndarray, std: np.ndarray) -> to
 def run_inference(
     image_bytes: bytes,
     checkpoint_path: Path,
+    checkpoint_name: str,
     threshold: float = 0.5,
 ) -> dict:
     """
@@ -104,12 +156,24 @@ def run_inference(
     Args:
         image_bytes: Raw image bytes
         checkpoint_path: Path to checkpoint file
+        checkpoint_name: Checkpoint filename (for logging)
         threshold: Classification threshold
     
     Returns:
         Dict with label, confidence, risk_score, model_name, latency_ms
+    
+    Raises:
+        ValueError: If image is invalid
     """
     start = time.perf_counter()
+    
+    # Validate image
+    try:
+        image_format, image_pixels = validate_image_bytes(image_bytes)
+        logger.debug(f"Image validation passed: {image_format}, {image_pixels} pixels")
+    except ValueError as e:
+        metrics.log_error(checkpoint_name, str(e))
+        raise
     
     # Load normalization stats and model
     mean, std = get_normalization_stats()
@@ -127,11 +191,25 @@ def run_inference(
     # Classify
     label = "tumor" if score >= threshold else "no_tumor"
     confidence = score if label == "tumor" else 1.0 - score
+    model_name = str(ckpt.get("model_name", checkpoint_path.stem))
+    
+    # Log prediction
+    image_hash = hash_image(image_bytes)
+    metrics.log_prediction(
+        label=label,
+        confidence=confidence,
+        risk_score=score,
+        model_name=model_name,
+        latency_ms=latency_ms,
+        image_hash=image_hash,
+        checkpoint_name=checkpoint_name,
+        threshold=threshold,
+    )
     
     return {
         "label": label,
         "confidence": confidence,
         "risk_score": score,
-        "model_name": str(ckpt.get("model_name", checkpoint_path.stem)),
+        "model_name": model_name,
         "latency_ms": latency_ms,
     }

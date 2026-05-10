@@ -14,6 +14,7 @@ from .core import (
     run_inference,
     validate_checkpoint,
 )
+from .metrics import metrics
 from .schemas import AvailableModelsResponse, HealthResponse, PredictionRequest, PredictionResponse
 
 logger = logging.getLogger(__name__)
@@ -53,6 +54,12 @@ def health() -> HealthResponse:
     return HealthResponse(status="ok", version="0.1.0")
 
 
+@app.get("/metrics")
+def get_metrics() -> dict:
+    """Get API metrics (requests, latency, predictions)."""
+    return metrics.get_metrics()
+
+
 @app.get("/models", response_model=AvailableModelsResponse)
 def list_models() -> AvailableModelsResponse:
     """List available model checkpoints."""
@@ -79,17 +86,24 @@ def predict(request: PredictionRequest) -> PredictionResponse:
         # Decode base64 image
         image_bytes = base64.b64decode(request.image_base64)
     except Exception as e:
+        metrics.log_error(request.checkpoint_name, f"Invalid base64: {e}")
         raise HTTPException(status_code=400, detail=f"Invalid base64 image: {e}")
 
     # Validate checkpoint
     try:
         checkpoint_path = validate_checkpoint(request.checkpoint_name)
     except FileNotFoundError as e:
+        metrics.log_error(request.checkpoint_name, str(e))
         raise HTTPException(status_code=400, detail=str(e))
 
-    # Run inference
+    # Run inference with validation
     try:
-        result = run_inference(image_bytes, checkpoint_path, request.threshold)
+        result = run_inference(
+            image_bytes,
+            checkpoint_path,
+            request.checkpoint_name,
+            request.threshold,
+        )
         return PredictionResponse(
             label=result["label"],
             confidence=result["confidence"],
@@ -98,6 +112,9 @@ def predict(request: PredictionRequest) -> PredictionResponse:
             latency_ms=result["latency_ms"],
             checkpoint_path=str(checkpoint_path),
         )
+    except ValueError as e:
+        # Input validation error
+        raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:
         logger.error(f"Inference error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Inference failed: {e}")
@@ -120,17 +137,24 @@ async def predict_file(
     try:
         image_bytes = await file.read()
     except Exception as e:
+        metrics.log_error(checkpoint_name, f"Failed to read file: {e}")
         raise HTTPException(status_code=400, detail=f"Failed to read file: {e}")
 
     # Validate checkpoint
     try:
         checkpoint_path = validate_checkpoint(checkpoint_name)
     except FileNotFoundError as e:
+        metrics.log_error(checkpoint_name, str(e))
         raise HTTPException(status_code=400, detail=str(e))
 
-    # Run inference
+    # Run inference with validation
     try:
-        result = run_inference(image_bytes, checkpoint_path, threshold)
+        result = run_inference(
+            image_bytes,
+            checkpoint_path,
+            checkpoint_name,
+            threshold,
+        )
         return PredictionResponse(
             label=result["label"],
             confidence=result["confidence"],
@@ -139,6 +163,9 @@ async def predict_file(
             latency_ms=result["latency_ms"],
             checkpoint_path=str(checkpoint_path),
         )
+    except ValueError as e:
+        # Input validation error
+        raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:
         logger.error(f"Inference error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Inference failed: {e}")

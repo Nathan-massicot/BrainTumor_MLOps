@@ -39,6 +39,20 @@ def test_health():
     assert "version" in data
 
 
+def test_metrics():
+    """Test metrics endpoint."""
+    response = client.get("/metrics")
+    assert response.status_code == 200
+    data = response.json()
+    assert "total_requests" in data
+    assert "successful_requests" in data
+    assert "failed_requests" in data
+    assert "success_rate" in data
+    assert "latency_ms" in data
+    assert "predictions_by_label" in data
+    assert "models_used" in data
+
+
 def test_root():
     """Test root endpoint."""
     response = client.get("/")
@@ -70,6 +84,38 @@ def test_predict_invalid_base64():
     )
     assert response.status_code == 400
     assert "Invalid base64" in response.json()["detail"]
+
+
+def test_predict_empty_image():
+    """Test predict with empty image data."""
+    image_base64 = base64.b64encode(b"").decode()
+    response = client.post(
+        "/predict",
+        json={
+            "image_base64": image_base64,
+            "checkpoint_name": "resnet50_transfer.pt",
+        },
+    )
+    assert response.status_code == 422
+    assert "Empty" in response.json()["detail"] or "Invalid" in response.json()["detail"]
+
+
+def test_predict_tiny_image():
+    """Test predict with image smaller than 64x64."""
+    tiny_img = Image.new("RGB", (32, 32), color="red")
+    buf = BytesIO()
+    tiny_img.save(buf, format="PNG")
+    image_base64 = base64.b64encode(buf.getvalue()).decode()
+    
+    response = client.post(
+        "/predict",
+        json={
+            "image_base64": image_base64,
+            "checkpoint_name": "resnet50_transfer.pt",
+        },
+    )
+    assert response.status_code == 422
+    assert "too small" in response.json()["detail"].lower()
 
 
 def test_predict_invalid_checkpoint():
