@@ -1,61 +1,46 @@
-"""Interactive Streamlit frontend with a mock predictor.
+"""Interactive Streamlit frontend with real local model inference.
 
-This app is designed for issue #33 so you can build and learn in parallel
-while the real model/API is still being implemented.
+This app runs predictions directly from local checkpoints in `models/*.pt`.
 """
 
 from __future__ import annotations
 
 import hashlib
-import random
+import json
+import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 from PIL import Image
 import streamlit as st
-
+import torch
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SRC_ROOT = PROJECT_ROOT / "src"
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
+
+from mlops_project.models.factory import load_checkpoint
+
+
 DATA_ROOT = PROJECT_ROOT / "data" / "raw" / "kaggle_3m"
+MODELS_ROOT = PROJECT_ROOT / "models"
+PROCESSED_STATS_PATH = PROJECT_ROOT / "data" / "processed" / "norm_stats.json"
 SAMPLE_LIMIT = 6
+IMAGE_SIZE = 256
 
 
 @dataclass(frozen=True)
-class MockPrediction:
-    """Container for a fake prediction result."""
+class PredictionResult:
+    """Container for one model prediction."""
 
     label: str
     confidence: float
     risk_score: float
-
-
-def _stable_random_value(image_bytes: bytes, seed: int) -> float:
-    """Return a deterministic pseudo-random value in [0, 1]."""
-    digest = hashlib.sha256(image_bytes).hexdigest()
-    digest_seed = int(digest[:8], 16) + seed
-    rng = random.Random(digest_seed)
-    return rng.random()
-
-
-def run_mock_predictor(
-    image_bytes: bytes,
-    threshold: float,
-    tumor_bias: float,
-    seed: int,
-) -> MockPrediction:
-    """Generate a fake model output for UI and integration testing."""
-    base_score = _stable_random_value(image_bytes=image_bytes, seed=seed)
-    shifted_score = min(1.0, max(0.0, base_score + tumor_bias))
-
-    label = "tumor" if shifted_score >= threshold else "no_tumor"
-    confidence = shifted_score if label == "tumor" else 1.0 - shifted_score
-
-    return MockPrediction(
-        label=label,
-        confidence=confidence,
-        risk_score=shifted_score,
-    )
+    model_name: str
+    latency_ms: float
 
 
 def find_sample_images(limit: int = SAMPLE_LIMIT) -> list[Path]:
@@ -81,6 +66,13 @@ def find_sample_images(limit: int = SAMPLE_LIMIT) -> list[Path]:
     return samples
 
 
+def available_checkpoints() -> list[Path]:
+    """Return sorted local checkpoints available for inference."""
+    if not MODELS_ROOT.exists():
+        return []
+    return sorted(path for path in MODELS_ROOT.glob("*.pt") if path.is_file())
+
+
 def load_image(path: Path) -> Image.Image:
     """Load an image from disk for previewing in Streamlit."""
     return Image.open(path)
@@ -101,55 +93,66 @@ def to_grayscale(image: Image.Image) -> Image.Image:
     return image.convert("L")
 
 
-def generate_mock_attention(
-    image: Image.Image, prediction: MockPrediction, seed: int = 42
-) -> np.ndarray:
-    """Generate a mock attention heatmap showing where the model 'focuses'."""
-    rng = random.Random(seed + int(prediction.risk_score * 1000))
-    width, height = image.size
+@st.cache_data
+def load_normalization_stats(path_str: str) -> tuple[np.ndarray, np.ndarray]:
+    """Load per-channel mean/std used during training-time preprocessing."""
+    path = Path(path_str)
+    if not path.exists():
+        raise FileNotFoundError(
+            "Missing data/processed/norm_stats.json. "
+            "Run `python -m mlops_project.data.prepare` first."
+        )
 
-    center_x = rng.uniform(width * 0.3, width * 0.7)
-    center_y = rng.uniform(height * 0.3, height * 0.7)
-    sigma = rng.uniform(min(height, width) * 0.15, min(height, width) * 0.3)
-
-    x = np.linspace(0, width - 1, width)
-    y = np.linspace(0, height - 1, height)
-    xx, yy = np.meshgrid(x, y)
-
-    heatmap = np.exp(-((xx - center_x) ** 2 + (yy - center_y) ** 2) / (2 * sigma ** 2))
-    heatmap = heatmap / (heatmap.max() + 1e-8)
-    heatmap = heatmap * prediction.confidence
-
-    return heatmap
+    payload = json.loads(path.read_text())
+    mean = np.array(payload["mean"], dtype=np.float32).reshape(3, 1, 1)
+    std = np.array(payload["std"], dtype=np.float32).reshape(3, 1, 1)
+    std = np.clip(std, 1e-6, None)
+    return mean, std
 
 
-def apply_heatmap_overlay(image: Image.Image, heatmap: np.ndarray) -> np.ndarray:
-    """Blend a jet-colormap heatmap over the original image for better readability.
+@st.cache_resource
+def load_model_bundle(checkpoint_path_str: str):
+    """Load and cache a model checkpoint for repeated Streamlit runs."""
+    model, ckpt = load_checkpoint(checkpoint_path_str, device="cpu", eval_mode=True)
+    return model, ckpt
 
-    Returns an RGB uint8 array.
-    """
-    # Convert image to RGB numpy array
-    img_rgb = np.array(image.convert("RGB")).astype(float) / 255.0
-    h, w = img_rgb.shape[:2]
 
-    # Resize heatmap to match image if needed
-    if heatmap.shape != (h, w):
-        heatmap_img = Image.fromarray((heatmap * 255).astype(np.uint8)).resize((w, h), Image.BILINEAR)
-        heatmap = np.array(heatmap_img).astype(float) / 255.0
+def preprocess_for_model(image: Image.Image, mean: np.ndarray, std: np.ndarray) -> torch.Tensor:
+    """Convert a PIL image to the normalized tensor expected by trained models."""
+    rgb = image.convert("RGB").resize((IMAGE_SIZE, IMAGE_SIZE), Image.BILINEAR)
+    array = np.array(rgb, dtype=np.float32) / 255.0
+    chw = np.transpose(array, (2, 0, 1))
+    normalized = (chw - mean) / std
+    try:
+        tensor = torch.from_numpy(normalized).float().unsqueeze(0)
+    except RuntimeError:
+        # Fallback for environments where torch<->numpy binary compatibility is broken.
+        tensor = torch.tensor(normalized.tolist(), dtype=torch.float32).unsqueeze(0)
+    return tensor
 
-    # Apply jet colormap manually (blue → cyan → green → yellow → red)
-    def jet_colormap(t: np.ndarray) -> np.ndarray:
-        r = np.clip(1.5 - np.abs(t - 0.75) * 4, 0, 1)
-        g = np.clip(1.5 - np.abs(t - 0.50) * 4, 0, 1)
-        b = np.clip(1.5 - np.abs(t - 0.25) * 4, 0, 1)
-        return np.stack([r, g, b], axis=-1)
 
-    colored = jet_colormap(heatmap)  # (H, W, 3)
+def run_local_predictor(image: Image.Image, checkpoint_path: Path, threshold: float) -> PredictionResult:
+    """Run one forward pass from a local checkpoint and return UI-friendly values."""
+    start = time.perf_counter()
+    mean, std = load_normalization_stats(str(PROCESSED_STATS_PATH))
+    model, ckpt = load_model_bundle(str(checkpoint_path))
+    x = preprocess_for_model(image, mean, std)
 
-    # Blend: strong heatmap areas dominate, weak areas show original
-    alpha = heatmap[..., np.newaxis] * 0.65
-    blended = img_rgb * (1 - alpha) + colored * alpha
-    return (np.clip(blended, 0, 1) * 255).astype(np.uint8)
+    with torch.no_grad():
+        logits = model(x)
+        score = float(torch.sigmoid(logits).item())
+
+    latency_ms = (time.perf_counter() - start) * 1000.0
+    label = "tumor" if score >= threshold else "no_tumor"
+    confidence = score if label == "tumor" else 1.0 - score
+
+    return PredictionResult(
+        label=label,
+        confidence=confidence,
+        risk_score=score,
+        model_name=str(ckpt.get("model_name", checkpoint_path.stem)),
+        latency_ms=latency_ms,
+    )
 
 
 def main() -> None:
@@ -160,44 +163,44 @@ def main() -> None:
         st.session_state.selected_sample = None
 
     st.title("MLOps Brain Tumor Frontend Demo")
-    st.caption("Issue #33: interactive Streamlit UI with a mock model response")
+    st.caption("Real local inference from checkpoints in models/*.pt")
 
     st.info(
-        "This is a learning and integration scaffold. "
-        "Predictions are mocked and are not medically valid."
+        "Research/educational interface only. "
+        "Predictions are not clinically validated and must not be used for diagnosis."
     )
 
+    checkpoints = available_checkpoints()
+
     with st.sidebar:
-        st.header("Mock Controls")
+        st.header("Inference Controls")
         threshold = st.slider("Decision threshold", min_value=0.05, max_value=0.95, value=0.50)
-        tumor_bias = st.slider(
-            "Tumor bias",
-            min_value=-0.40,
-            max_value=0.40,
-            value=0.00,
-            help="Shift scores to simulate easier/harder positive detection.",
-        )
-        seed = st.number_input("Reproducibility seed", min_value=0, max_value=9999, value=42)
+
+        if not checkpoints:
+            st.error("No checkpoints found in models/. Add at least one .pt model file.")
+            selected_checkpoint = None
+        else:
+            checkpoint_names = [path.name for path in checkpoints]
+            selected_name = st.selectbox("Checkpoint", checkpoint_names, index=0)
+            selected_checkpoint = MODELS_ROOT / selected_name
 
         st.divider()
-        st.markdown("### How to Learn")
-        st.markdown("1. Upload an MRI image.")
-        st.markdown("2. Or choose a raw dataset example.")
-        st.markdown("3. Change threshold and bias.")
-        st.markdown("4. Click predict and inspect outputs.")
-        st.markdown("5. Repeat with the same image to see deterministic behavior.")
+        st.markdown("### How to Use")
+        st.markdown("1. Select a checkpoint.")
+        st.markdown("2. Upload an MRI image or choose an example.")
+        st.markdown("3. Run prediction and inspect confidence + latency.")
 
     left_col, right_col = st.columns([1.2, 1.0])
 
     with left_col:
         input_mode = st.radio("Input source", ["Upload", "Examples"], horizontal=True)
 
-        uploaded_file = None
         selected_example: Path | None = None
         file_bytes: bytes | None = None
         display_name = ""
-        preview_image = None
-        mask_image = None
+        preview_image: Image.Image | None = None
+        source_image: Image.Image | None = None
+        mask_image: Image.Image | None = None
 
         if input_mode == "Upload":
             uploaded_file = st.file_uploader(
@@ -209,7 +212,8 @@ def main() -> None:
             else:
                 file_bytes = uploaded_file.getvalue()
                 display_name = uploaded_file.name
-                preview_image = to_grayscale(Image.open(uploaded_file))
+                source_image = Image.open(uploaded_file).convert("RGB")
+                preview_image = to_grayscale(source_image)
 
         else:
             sample_images = find_sample_images()
@@ -234,93 +238,103 @@ def main() -> None:
                     selected_example = Path(st.session_state.selected_sample)
                     file_bytes = load_bytes_from_path(selected_example)
                     display_name = selected_example.name
-                    preview_image = to_grayscale(load_image(selected_example))
+                    source_image = load_image(selected_example).convert("RGB")
+                    preview_image = to_grayscale(source_image)
                     possible_mask = mask_path_for(selected_example)
                     if possible_mask.exists():
-                        # Load mask as RGB so white regions are actually visible
                         mask_image = load_image(possible_mask).convert("RGB")
 
-        if file_bytes is None:
+        if file_bytes is None or source_image is None:
             return
 
         st.subheader("Selected Input")
         st.write(f"File name: {display_name}")
         st.write(f"File size: {len(file_bytes)} bytes")
         st.write(f"SHA-256 (short): {hashlib.sha256(file_bytes).hexdigest()[:16]}")
+
         if preview_image is not None:
             st.image(preview_image, caption="Input preview (grayscale)", use_container_width=True)
 
         if mask_image is not None:
             st.image(mask_image, caption="Reference mask from raw data", use_container_width=True)
 
-        predict_clicked = input_mode == "Upload" and st.button("Run mock prediction", type="primary")
+        predict_clicked = input_mode == "Upload" and st.button("Run prediction", type="primary")
 
     with right_col:
         st.subheader("Prediction")
         should_predict = predict_clicked or (input_mode == "Examples" and file_bytes is not None)
 
-        if should_predict and file_bytes is not None:
-            result = run_mock_predictor(
-                image_bytes=file_bytes,
-                threshold=float(threshold),
-                tumor_bias=float(tumor_bias),
-                seed=int(seed),
-            )
+        if selected_checkpoint is None:
+            st.caption("Add a checkpoint in models/ to enable local inference.")
+            return
+
+        if should_predict and file_bytes is not None and source_image is not None:
+            try:
+                result = run_local_predictor(
+                    image=source_image,
+                    checkpoint_path=selected_checkpoint,
+                    threshold=float(threshold),
+                )
+            except FileNotFoundError as exc:
+                st.error(str(exc))
+                return
+            except Exception as exc:
+                st.error(f"Prediction failed: {exc}")
+                return
 
             st.metric("Predicted class", result.label.upper())
             st.metric("Confidence", f"{result.confidence * 100:.1f}%")
+            st.metric("Model", result.model_name)
+            st.metric("Latency", f"{result.latency_ms:.1f} ms")
             st.progress(result.risk_score, text=f"Risk score: {result.risk_score:.2f}")
 
             if result.label == "tumor":
-                st.warning(f"⚠️ Model output: **TUMOR DETECTED** (confidence: {result.confidence*100:.1f}%)")
+                st.warning(f"Model output: **TUMOR DETECTED** (confidence: {result.confidence*100:.1f}%)")
             else:
-                st.info(f"✓ Model output: **NO TUMOR** (confidence: {result.confidence*100:.1f}%)")
+                st.info(f"Model output: **NO TUMOR** (confidence: {result.confidence*100:.1f}%)")
 
             if input_mode == "Examples" and selected_example is not None:
                 st.caption(f"Auto-run from raw example: {selected_example.relative_to(DATA_ROOT.parent)}")
 
-            # Attention visualization with improved jet colormap overlay
-            with st.expander("📍 Model Focus Map (Attention Visualization)"):
-                st.markdown(
-                    f"This visualization shows where the model focuses to make its prediction. "
-                    f"**Confidence: {result.confidence*100:.1f}%** — warmer colors (red/yellow) indicate higher attention."
-                )
-
-                if preview_image is not None:
-                    attention = generate_mock_attention(preview_image, result, seed=int(seed))
-                    overlay = apply_heatmap_overlay(preview_image, attention)
-
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        st.image(preview_image, caption="Original Image (grayscale)", use_container_width=True)
-                    with col2:
-                        st.image(overlay, caption="Focus Map (red = high attention)", use_container_width=True)
-
-                    st.markdown(
-                        f"The focus map highlights regions contributing to the **{result.label.upper()}** prediction "
-                        f"with {result.confidence*100:.1f}% confidence."
+            with st.expander("Explainability Status"):
+                if result.model_name == "baseline":
+                    st.info(
+                        "Spatial focus is not available for the baseline model. "
+                        "This model uses global image statistics (mean/std per channel), "
+                        "so it does not attend to specific regions."
                     )
+                else:
+                    st.info(
+                        "Spatial focus maps (Grad-CAM) are not shown yet. "
+                        "For now, trust the prediction score and confidence metric only. "
+                        "Future work: implement Grad-CAM or occlusion sensitivity from model internals."
+                    )
+
+                st.markdown(
+                    "Current app behavior: we show real prediction scores (class, confidence, latency). "
+                    "No synthetic or computed localization maps are shown."
+                )
 
             with st.expander("What happened behind the scenes?"):
                 st.markdown(
-                    "- We hashed the uploaded bytes for deterministic scoring.\n"
-                    "- We applied a user-controlled bias to simulate model behavior.\n"
-                    "- We compared score vs threshold to choose a class.\n"
-                    "- We generated a mock attention map using a jet colormap overlay.\n"
-                    "- This is a mock pipeline to unblock UI development."
+                    "- Selected a local checkpoint from models/*.pt.\n"
+                    "- Loaded training normalization stats from data/processed/norm_stats.json.\n"
+                    "- Resized image to 256x256, normalized channels, and ran one forward pass.\n"
+                    "- Applied sigmoid to get tumour probability and compared with threshold.\n"
+                    "- Rendered prediction metrics without localization maps."
                 )
 
         else:
             if input_mode == "Examples":
                 st.caption("Choose one of the raw dataset examples to see the output.")
             else:
-                st.caption("Click 'Run mock prediction' to generate output.")
+                st.caption("Click 'Run prediction' to generate output.")
 
     st.divider()
     st.subheader("Next Integration Step")
     st.code(
         """
-# Replace run_mock_predictor(...) with real API call:
+# Optional API mode (future):
 # POST /predict
 # payload = uploaded image
 # response = {label, confidence, latency_ms, model_version}
