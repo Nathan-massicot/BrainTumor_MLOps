@@ -1,9 +1,7 @@
-"""Interactive Streamlit frontend with real local model inference.
+"""NeuroScan — Brain Tumor Detection Frontend.
 
-Clinical radiology UI with:
-- Dark medical theme (IBM Plex, monochrome panels)
-- Structured diagnostic report panel
-- Side-by-side checkpoint comparison mode
+Clinical radiology UI with dark medical theme, structured diagnostic
+reports, and side-by-side checkpoint comparison.
 """
 
 from __future__ import annotations
@@ -27,6 +25,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from mlops_project.models.factory import load_checkpoint
+from mlops_project.api.metrics import metrics
 
 DATA_ROOT = PROJECT_ROOT / "data" / "raw" / "kaggle_3m"
 MODELS_ROOT = PROJECT_ROOT / "models"
@@ -60,12 +59,10 @@ html, body, [class*="css"] {
     letter-spacing: 0.12em;
     text-transform: uppercase;
 }
-
 [data-testid="stSlider"] > div > div > div { background: #1e2936 !important; }
 [data-testid="stSlider"] [data-baseweb="slider"] div[role="slider"] {
     background: #4fc3f7 !important; border-color: #4fc3f7 !important;
 }
-
 [data-testid="stMetric"] {
     background: #0d1117;
     border: 1px solid #1e2936;
@@ -84,7 +81,6 @@ html, body, [class*="css"] {
     font-family: 'IBM Plex Mono', monospace !important;
     font-size: 1.4rem !important;
 }
-
 [data-testid="stButton"] button {
     background: transparent !important;
     border: 1px solid #2a3a4a !important;
@@ -104,7 +100,6 @@ html, body, [class*="css"] {
 [data-testid="stButton"] button:hover {
     border-color: #4fc3f7 !important; color: #4fc3f7 !important;
 }
-
 [data-testid="stRadio"] label { color: #8a9bb0 !important; font-size: 0.8rem !important; }
 [data-testid="stFileUploader"] {
     background: #0d1117 !important;
@@ -126,11 +121,6 @@ html, body, [class*="css"] {
     font-family: 'IBM Plex Mono', monospace !important;
 }
 [data-testid="stImage"] img { border: 1px solid #1e2936 !important; border-radius: 2px; }
-[data-testid="stCode"] {
-    background: #0d1117 !important;
-    border: 1px solid #1e2936 !important;
-    font-family: 'IBM Plex Mono', monospace !important;
-}
 [data-testid="stAlert"] { background: #0d1117 !important; border-radius: 2px !important; border-width: 1px !important; }
 hr { border-color: #1e2936 !important; }
 
@@ -259,8 +249,8 @@ def load_normalization_stats(path_str: str) -> tuple[np.ndarray, np.ndarray]:
     path = Path(path_str)
     if not path.exists():
         raise FileNotFoundError(
-            "Missing data/processed/norm_stats.json. "
-            "Run `python -m mlops_project.data.prepare` first."
+            "Normalization statistics not found. "
+            "Run `python -m mlops_project.data.prepare` to generate them."
         )
     payload = json.loads(path.read_text())
     mean = np.array(payload["mean"], dtype=np.float32).reshape(3, 1, 1)
@@ -295,11 +285,24 @@ def run_local_predictor(image: Image.Image, checkpoint_path: Path, threshold: fl
     latency_ms = (time.perf_counter() - start) * 1000.0
     label = "tumor" if score >= threshold else "no_tumor"
     confidence = score if label == "tumor" else 1.0 - score
+    model_name = str(ckpt.get("model_name", checkpoint_path.stem))
+
+    metrics.log_prediction(
+        label=label,
+        confidence=confidence,
+        risk_score=score,
+        model_name=model_name,
+        latency_ms=latency_ms,
+        image_hash=hashlib.sha256(image.tobytes()).hexdigest()[:16],
+        checkpoint_name=checkpoint_path.name,
+        threshold=threshold,
+    )
+
     return PredictionResult(
         label=label,
         confidence=confidence,
         risk_score=score,
-        model_name=str(ckpt.get("model_name", checkpoint_path.stem)),
+        model_name=model_name,
         latency_ms=latency_ms,
     )
 
@@ -330,23 +333,6 @@ def render_diagnostic_report(
     now: datetime,
 ) -> None:
     study_id = hashlib.sha256(file_bytes).hexdigest()[:12].upper()
-    finding_text = (
-        "Hyperintense lesion identified within the cerebral parenchyma. "
-        "Signal characteristics are consistent with a neoplastic process. "
-        "Recommend correlation with clinical presentation and further imaging."
-        if result.label == "tumor"
-        else
-        "No focal hyperintense lesions identified within the cerebral parenchyma. "
-        "No midline shift. No evidence of mass effect or herniation. "
-        "Normal signal intensity throughout."
-    )
-    impression_text = (
-        "POSITIVE — Findings suggestive of intracranial neoplasm."
-        if result.label == "tumor"
-        else
-        "NEGATIVE — No significant intracranial pathology detected."
-    )
-    impression_class = "report-impression-tumor" if result.label == "tumor" else "report-impression-clear"
 
     st.markdown(
         f"""
@@ -366,14 +352,6 @@ def render_diagnostic_report(
                 <tr><td>Confidence</td><td>{result.confidence * 100:.2f}%</td></tr>
                 <tr><td>Latency</td><td>{result.latency_ms:.1f} ms</td></tr>
             </table>
-            <div style='margin-top:1rem;'>
-                <span class='report-label'>Finding</span>
-                <div class='report-finding'>{finding_text}</div>
-            </div>
-            <div style='margin-top:0.8rem;'>
-                <span class='report-label'>Impression</span>
-                <div class='report-finding {impression_class}'>{impression_text}</div>
-            </div>
             <div style='margin-top:0.8rem; color:#2a3a4a; font-size:0.6rem;'>
                 ⚠ NOT FOR CLINICAL USE · Research and educational purposes only ·
                 Results are not clinically validated and must not influence medical decisions.
@@ -487,7 +465,7 @@ def main() -> None:
 
         st.markdown("<div class='clinical-header'>Checkpoint(s)</div>", unsafe_allow_html=True)
         if not checkpoints:
-            st.error("No .pt files found in models/")
+            st.error("No model checkpoints found in models/")
             ckpt_a = ckpt_b = None
         else:
             names = [p.name for p in checkpoints]
@@ -538,7 +516,10 @@ def main() -> None:
 
     with left_col:
         st.markdown("<div class='clinical-header'>Image Input</div>", unsafe_allow_html=True)
-        input_mode = st.radio("Source", ["Upload image", "Dataset examples"], horizontal=True, label_visibility="collapsed")
+        input_mode = st.radio(
+            "Source", ["Upload image", "Dataset examples"],
+            horizontal=True, label_visibility="collapsed",
+        )
 
         file_bytes: bytes | None = None
         display_name = ""
@@ -559,6 +540,7 @@ def main() -> None:
                 display_name = uploaded_file.name
                 source_image = Image.open(uploaded_file).convert("RGB")
                 preview_image = to_grayscale(source_image)
+
         else:
             sample_images = find_sample_images()
             if not sample_images:
@@ -610,7 +592,7 @@ def main() -> None:
             st.image(mask_image, use_container_width=True)
 
         predict_clicked = (input_mode == "Upload image") and st.button(
-            "▶  Run Analysis", type="primary", use_container_width=True
+            "▶  Run Analysis", type="primary", use_container_width=True,
         )
 
     # ── Results ───────────────────────────────────────────────────────────────
@@ -628,7 +610,7 @@ def main() -> None:
             return
 
         if ckpt_a is None:
-            st.error("No checkpoint selected. Add a .pt file to models/")
+            st.error("No checkpoint selected. Add a .pt file to the models/ directory.")
             return
 
         # ── Single model ──────────────────────────────────────────────────────
@@ -639,19 +621,21 @@ def main() -> None:
             except FileNotFoundError as e:
                 st.error(str(e)); return
             except Exception as e:
-                st.error(f"Prediction failed: {e}"); return
+                st.error(f"Analysis failed: {e}"); return
 
             render_badge(result.label)
             render_metrics(result)
             render_diagnostic_report(result, file_bytes, display_name, float(threshold), now)
 
-            with st.expander("⚙ Pipeline internals"):
+            with st.expander("⚙ Analysis Details"):
                 st.markdown(
-                    f"- Checkpoint: `{ckpt_a.name}`\n"
-                    "- Norm stats from `data/processed/norm_stats.json`\n"
-                    f"- Resized to {IMAGE_SIZE}×{IMAGE_SIZE}, normalized, forward pass\n"
-                    "- Sigmoid → threshold → label\n"
-                    "- Grad-CAM localization: pending future work"
+                    f"**Checkpoint:** `{ckpt_a.name}`  \n"
+                    f"**Architecture:** `{result.model_name}`  \n"
+                    f"**Input resolution:** {IMAGE_SIZE}×{IMAGE_SIZE} px  \n"
+                    f"**Normalization:** per-channel mean/std from training set  \n"
+                    f"**Inference device:** CPU  \n"
+                    f"**Decision threshold:** {float(threshold):.2f}  \n"
+                    f"**Prediction logged:** yes"
                 )
 
         # ── Comparison mode ───────────────────────────────────────────────────
@@ -666,7 +650,7 @@ def main() -> None:
             except FileNotFoundError as e:
                 st.error(str(e)); return
             except Exception as e:
-                st.error(f"Prediction failed: {e}"); return
+                st.error(f"Analysis failed: {e}"); return
 
             col_a, col_vs, col_b = st.columns([1, 0.12, 1])
 
@@ -694,38 +678,16 @@ def main() -> None:
             st.markdown("<div class='clinical-header'>Comparison Report</div>", unsafe_allow_html=True)
             render_comparison_report(r1, r2, file_bytes, display_name, float(threshold), now)
 
-            with st.expander("⚙ Pipeline internals"):
+            with st.expander("⚙ Analysis Details"):
                 st.markdown(
-                    f"- Model A: `{ckpt_a.name}` · Model B: `{ckpt_b.name}`\n"
-                    "- Shared threshold and normalization stats\n"
-                    "- Independent forward passes, results diffed\n"
-                    "- Grad-CAM: pending future work"
+                    f"**Model A:** `{ckpt_a.name}` ({r1.model_name})  \n"
+                    f"**Model B:** `{ckpt_b.name}` ({r2.model_name})  \n"
+                    f"**Shared threshold:** {float(threshold):.2f}  \n"
+                    f"**Input resolution:** {IMAGE_SIZE}×{IMAGE_SIZE} px  \n"
+                    f"**Normalization:** per-channel mean/std from training set  \n"
+                    f"**Inference device:** CPU  \n"
+                    f"**Both predictions logged:** yes"
                 )
-
-    # ── Footer ────────────────────────────────────────────────────────────────
-    st.divider()
-    fc1, fc2 = st.columns([2, 1])
-    with fc1:
-        st.markdown("<div class='clinical-header'>Next Integration Step</div>", unsafe_allow_html=True)
-        st.code(
-            "# Optional API mode (future):\n"
-            "# POST /predict\n"
-            "# payload  = { image: <bytes>, checkpoint: str }\n"
-            "# response = { label, confidence, risk_score, latency_ms, model_version }",
-            language="python",
-        )
-    with fc2:
-        st.markdown("<div class='clinical-header'>Pipeline Status</div>", unsafe_allow_html=True)
-        st.markdown(
-            "<div class='study-info'>"
-            "Data ingestion: <span style='color:#22c55e'>✓ Ready</span><br>"
-            "Model training: <span style='color:#f59e0b'>⧗ In progress</span><br>"
-            "Inference API: <span style='color:#ef4444'>✗ Pending</span><br>"
-            "Monitoring: <span style='color:#ef4444'>✗ Pending</span><br>"
-            "Retraining loop: <span style='color:#ef4444'>✗ Pending</span>"
-            "</div>",
-            unsafe_allow_html=True,
-        )
 
 
 if __name__ == "__main__":
